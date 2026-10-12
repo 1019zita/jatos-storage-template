@@ -8,8 +8,8 @@
         let firstWriteError = null;
         let readyPromise = null;
         const recordedTrials = [];
-        // 断点续做用的 Batch Session 键名，形如 "exp1_fcdt:<workerId>"
-        // 之所以按 workerId 分键：Batch Session 对同批次所有被试可见，
+        // 断点续做用的 Batch Session 键名，形如 "exp1_fcdt:<subjectHash>"
+        // 之所以按被试分键：Batch Session 对同批次所有被试可见，
         // 分键可把每个人的进度隔离在自己的键下，也避免多人并发写同一对象导致冲突。
         let progressKeyName = null;
 
@@ -46,8 +46,8 @@
         // 同批次被试都能读到。因此这里**只存进度**，绝不写入
         // 姓名 / 身份证 / 手机号 / 性别 / 年龄等任何个人信息。
         //
-        // 唯一与身份有关的字段是 subjectHash（subjectID 的 SHA-256 前 16 位十六进制）。
-        // 它只用于回答"这条进度是不是同一个人留下的"，由本层自己算、自己比：
+        // 唯一与身份有关的东西是 subjectHash（subjectID 的 SHA-256 前 16 位十六进制），
+        // 而且它只出现在**键名**里、由本层自己算自己用；进度记录本身只存进度字段，
         // 实验脚本既不传也不读，原始编号不会散落到第二个地方。
         // 强度边界要说清楚：subjectID 只有 10 位数字（身份证后6位 + 手机后4位），
         // 空间仅 10^10，拿到哈希的人仍可离线穷举；它挡的是"同批次被试随手看到
@@ -234,18 +234,25 @@
                 await getReadyPromise();
                 context = initialContext;
 
-                // 进度键名 = experiment + ':' + workerId，两者都必须由调用方给出：
+                // 进度键名 = experiment + ':' + subjectHash，两者都必须拿得到：
                 //   experiment：实验脚本传入（exp1_clt / exp1_fcdt），保证同一 Study 下
                 //     不同实验的进度互不覆盖；
-                //   workerId：JATOS 分配并存在浏览器 cookie 里——同一浏览器重开同一条
-                //     被试链接时会拿到同一个 workerId，续做正是依赖这一点。
-                // 缺任意一个（本地脱离 JATOS 直接打开，或调用方漏传 experiment）就关闭
-                // 续做能力：宁可没有进度，也不能让两个实验落到同一个键上。
+                //   subjectHash：被试编号（身份证后 6 位 + 手机后 4 位）的 SHA-256 前 16 位。
+                //
+                // 为什么后缀不是 jatos.workerId（2026-10-12 在 MindProbe 实测后改的）：
+                //   General Single / Multiple 链接下 JATOS **每次运行都分配新的 workerId**
+                //   （同一条链接连续三次运行实测得到 1221113 / 1221129 / 1221133），
+                //   于是键名每次都不同 → 续做永不触发，还会在 Batch Session 留下垃圾键。
+                //   改成与被试绑定后：同一个人（换标签页 / 关窗重进 / 换设备）拿到同一个键，
+                //   不同的人拿到不同键——续做与隔离同时成立，且不依赖链接类型。
+                //
+                // 缺 experiment、或被试编号拿不到、或无法计算哈希（非安全上下文）就关闭
+                // 续做能力：宁可没有进度，也不能让两个人落到同一个键上。
                 const expName = (context && context.experiment) ? String(context.experiment).trim() : '';
-                const workerId = (global.jatos && global.jatos.workerId) ? String(global.jatos.workerId) : '';
-                progressKeyName = (expName && workerId) ? (expName + ':' + workerId) : null;
+                const subjectHash = await hashSubjectId(subjectIdFromContext());
+                progressKeyName = (expName && subjectHash) ? (expName + ':' + subjectHash) : null;
                 if (!progressKeyName) {
-                    console.warn('[CLT storage] 缺少 experiment 名称或 workerId，断点续做已关闭（其余功能不受影响）');
+                    console.warn('[CLT storage] 缺少 experiment 名称或可用的被试编号哈希，断点续做已关闭（其余功能不受影响）');
                 }
 
                 if (typeof global.jatos.showBeforeUnloadWarning === 'function') global.jatos.showBeforeUnloadWarning(true);
@@ -265,44 +272,30 @@
             saveCheckpoint(checkpoint) { return append(envelope('checkpoint', checkpoint)); },
 
             // 读取上次未完成的进度。返回 null = "没有可续做的进度"。
-            // 归属校验在本层完成：只有 subjectHash 与当前被试一致时才返回；
-            // 缺哈希（非安全上下文）或哈希不一致一律返回 null（fail closed）。
-            // 返回的对象已去掉 subjectHash —— 实验脚本不需要、也不应该依赖它。
+            // 归属校验由键名承担：键名含当前被试的哈希，不同被试的键不同，
+            // 因此这里读到的记录必然属于本人，记录里也不再重复存身份字段。
             loadProgress() {
                 if (!progressKeyName) return Promise.resolve(null);
                 const raw = batchGet(progressKeyName);
                 if (!raw || typeof raw !== 'object') return Promise.resolve(null);
-                return hashSubjectId(subjectIdFromContext()).then(ownHash => {
-                    if (!ownHash) {
-                        console.warn('[CLT storage] 无法计算 subjectID 哈希（非安全上下文），本次不续做。');
-                        return null;
-                    }
-                    if (raw.subjectHash !== ownHash) {
-                        console.warn('[CLT storage] 该进度属于其他被试，本次不续做。');
-                        return null;
-                    }
-                    const progress = Object.assign({}, raw);
-                    delete progress.subjectHash;
-                    return progress;
-                });
+                return Promise.resolve(Object.assign({}, raw));
             },
 
-            // 保存进度。progress 只放进度信息；身份字段由本层自己注入，
-            // 调用方误传的 subjectTail / subjectId 一律删除（原始编号禁止进 Batch Session）。
+            // 保存进度。progress 只放进度信息：归属由键名表达，记录里不放任何身份字段，
+            // 调用方误传的 subjectHash / subjectTail / subjectId 一律删除。
             saveProgress(progress) {
                 if (!progressKeyName) return Promise.resolve(false);
-                return hashSubjectId(subjectIdFromContext()).then(subjectHash => {
-                    const record = Object.assign({}, progress, { subjectHash: subjectHash });
-                    delete record.subjectTail;
-                    delete record.subjectId;
-                    return batchSet(progressKeyName, record)
-                        .then(() => true)
-                        .catch(error => {
-                            // 续做只是保险机制，存不进去不能影响实验本身继续跑
-                            console.warn('[CLT storage] 进度保存失败（不影响实验进行）：', error);
-                            return false;
-                        });
-                });
+                const record = Object.assign({}, progress);
+                delete record.subjectHash;
+                delete record.subjectTail;
+                delete record.subjectId;
+                return batchSet(progressKeyName, record)
+                    .then(() => true)
+                    .catch(error => {
+                        // 续做只是保险机制，存不进去不能影响实验本身继续跑
+                        console.warn('[CLT storage] 进度保存失败（不影响实验进行）：', error);
+                        return false;
+                    });
             },
 
             // 实验正常结束后清除进度，避免同一个被试下次进来被误判为"上次没做完"。

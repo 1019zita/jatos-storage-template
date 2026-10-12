@@ -30,8 +30,8 @@ JATOS / Supabase 存储层的**唯一权威实现**。所有网页实验（CLT�
 | `saveCheckpoint(cp)` | 追加一条 `checkpoint` 记录（审计用，不可读回） |
 | `saveFinalResult(payload)` | 追加 `final` 记录，并上传 participant CSV result file |
 | `finishExperiment(status)` | flush 队列并结束 Study |
-| `loadProgress()` | 读回进度；**归属校验已在本层完成**，不属于当前被试时返回 `null` |
-| `saveProgress(progress)` | 写进度；身份字段由本层自己注入，调用方传入的一律删除 |
+| `loadProgress()` | 读回进度；**归属由键名保证**（键名含被试哈希），读不到别人的进度 |
+| `saveProgress(progress)` | 写进度；记录里只放进度字段，调用方传入的任何身份字段一律删除 |
 | `clearProgress()` | 清除进度（实验正常结束 / 被试选择重新开始时调用） |
 | `getMetadata()` / `backendName` | 当前后端与构建元数据 |
 
@@ -39,19 +39,34 @@ JATOS / Supabase 存储层的**唯一权威实现**。所有网页实验（CLT�
 
 ## 隐私红线（Batch Session 对同批次所有被试可见）
 
-- 只允许写进度字段：`completedBlocks` / `resumeCount` / `updatedAt`。
-- 唯一与身份有关的字段是 `subjectHash` = `SHA-256(subjectID)` 前 16 位十六进制，由本层计算与比对；
-  原始编号及其片段（历史字段 `subjectTail`）一律不写入。
+- 记录里只允许出现进度字段：`completedBlocks` / `resumeCount` / `updatedAt`。
+- 唯一与身份有关的东西是 `subjectHash` = `SHA-256(subjectID)` 前 16 位十六进制，
+  它只出现在**键名**里，由本层自己算、自己用。原始编号及其片段（历史字段 `subjectTail`）一律不写入。
 - **强度边界**：`subjectID` 只有 10 位数字（身份证后 6 位 + 手机后 4 位），空间仅 10^10，
   拿到哈希的人仍可离线穷举。它挡的是「同批次被试随手看到别人的身份证 / 手机号片段」，
-  不是密码学意义上的匿名化。要更强就把这个字段删掉、只靠 `workerId` 隔离。
-- 拿不到 `crypto.subtle`（非 HTTPS / 非 localhost）时哈希为 `null`，`loadProgress()` 一律返回 `null`
-  （fail closed：宁可不续做，也不把可能属于别人的进度交出去）。
+  不是密码学意义上的匿名化。要更强就得放弃"同一个人可续做"这个能力（那需要与人员无关的键）。
+- 拿不到 `crypto.subtle`（非 HTTPS / 非 localhost）时算不出哈希 → 关闭续做能力（不写不读不落键），
+  而不是退回某个弱标识。
 
 ## 进度键名
 
-`<experiment>:<workerId>`，例如 `exp1_clt:w-77`。两者缺任意一个即关闭续做能力并 `console.warn`，
-不会退回某个共用键——否则同一 Study 下两个实验会互相覆盖进度。
+`<experiment>:<subjectHash>`，例如 `exp1_clt:75eb1f04e696914b`。
+
+- `experiment` 由实验脚本传入，保证同一 Study 下不同实验的进度互不覆盖。
+- `subjectHash` 与被试绑定，**不依赖链接类型**：同一个人换标签页、关窗重进、换设备都落到同一个键；
+  不同的人天然落到不同键。缺任意一个即关闭续做能力并 `console.warn`，不会退回某个共用键。
+
+早期版本用的是 `jatos.workerId` 作后缀，2026-10-12 在 MindProbe 实测后被替换：
+
+| 实测 | 结果 |
+|---|---|
+| 同一条 General Multiple 链接连续运行三次 | workerId = **1221113 / 1221129 / 1221133**（每次都是新的） |
+| cookie 证据 | 只有 `JATOS_ID_<studyResultId>`（每个 study result 一个），没有 worker 级 cookie；`workerType=GeneralMultiple` |
+| 后果 | 键名每次都不同 → `loadProgress()` 永远读到空 → **续做永不触发**，还在 Batch Session 里留下垃圾键 |
+| 症状 | 非 debug 跑到 block 1 结束（进度写在 `exp1_clt:1221129`），用**同一身份证/手机号**重开链接 → 新 workerId → `resumeStartBlock=1`，没有续做 |
+
+Personal Single / Multiple 链接下 workerId 是稳定的（JATOS 把 worker 绑在链接上），
+所以旧写法只在 Personal 链接上碰巧可用——依赖链接类型是隐患，现已改为与被试绑定。
 
 ## Batch Session 实测契约（JATOS 3.11.1，2026-10-12 在真实实例上量得）
 

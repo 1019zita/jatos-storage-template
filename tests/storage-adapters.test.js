@@ -14,6 +14,14 @@ const vm = require('node:vm');
 
 const root = path.resolve(__dirname, '..');
 
+// 键名后缀 = SHA-256(subjectID) 前 16 位十六进制。这里独立算一遍，
+// 用于把"键名到底怎么来的"钉死（而不是只断言"键存在"）。
+const nodeCrypto = require('node:crypto');
+
+function expectedSubjectHash(subjectID) {
+    return nodeCrypto.createHash('sha256').update(String(subjectID)).digest('hex').slice(0, 16);
+}
+
 
 
 function load(relative, context, transform = source => source) {
@@ -494,7 +502,7 @@ async function testJatosProgress() {
 
     assert.equal(await adapter.loadProgress(), null);
 
-    // 2) 保存进度：调用方只给进度字段，身份字段由存储层自己注入
+    // 2) 保存进度：调用方只给进度字段，身份信息由键名承担
 
     const progress = {
 
@@ -502,11 +510,13 @@ async function testJatosProgress() {
 
         resumeCount: 1,
 
-        // 故意混入历史字段：存储层必须删掉，绝不能落进 Batch Session
+        // 故意混入历史/身份字段：存储层必须删掉，绝不能落进 Batch Session
 
         subjectTail: '345678',
 
         subjectId: '00123',
+
+        subjectHash: 'deadbeefdeadbeef',
 
         updatedAt: '2026-10-10T04:00:00.000Z'
 
@@ -514,7 +524,7 @@ async function testJatosProgress() {
 
     assert.equal(await adapter.saveProgress(progress), true);
 
-    // 3) 读回来只剩进度字段：subjectHash 由存储层内部使用，不外泄给实验脚本
+    // 3) 读回来只剩进度字段（键名已表达归属，记录里不再重复存身份字段）
 
     const loaded = await adapter.loadProgress();
 
@@ -524,9 +534,12 @@ async function testJatosProgress() {
 
     assert.equal(loaded.resumeCount, 1);
 
-    // 4) 键名 = 实验名 + workerId：不同实验、不同被试互不干扰
+    // 4) 键名 = 实验名 + SHA-256(subjectID) 前 16 位：
+    //    与被试绑定，而不是与 jatos.workerId 绑定（后者在 General 链接下每次运行都变）
 
-    const expectedKey = 'demo_exp:w-77';
+    const expectedKey = 'demo_exp:' + expectedSubjectHash('00123');
+
+    assert.match(expectedKey, /^demo_exp:[0-9a-f]{16}$/);
 
     assert.ok(
 
@@ -536,16 +549,18 @@ async function testJatosProgress() {
 
     );
 
-    // 5) 隐私红线：Batch Session 对同批次所有被试可见，
-    //    只允许出现 16 位十六进制的 subjectHash，绝不能出现原始编号或其片段
+    // 5) 隐私红线：Batch Session 对同批次所有被试可见。
+    //    键名里只有 16 位十六进制哈希；记录里不得出现任何身份字段或原始编号片段。
 
     const stored = batchStore[expectedKey];
+
+    assert.deepEqual(Object.keys(stored).sort(), ['completedBlocks', 'resumeCount', 'updatedAt']);
+
+    assert.equal(stored.subjectHash, undefined, '记录里不得再存 subjectHash（键名已表达归属）');
 
     assert.equal(stored.subjectTail, undefined, '历史字段 subjectTail 不得写入');
 
     assert.equal(stored.subjectId, undefined, '原始被试编号不得写入');
-
-    assert.match(stored.subjectHash, /^[0-9a-f]{16}$/, 'subjectHash 应为 16 位十六进制');
 
     const serialized = JSON.stringify(batchStore);
 
@@ -553,7 +568,7 @@ async function testJatosProgress() {
 
     assert.ok(!serialized.includes('345678'), 'Batch Session 不得出现编号片段');
 
-    // 6) 归属校验：同一个键，换一个被试读，必须拿不到别人的进度
+    // 6) 隔离：换一个被试，键名不同，读不到别人的进度
 
     const otherAdapter = window.CLTStorageFactories.jatos({
 
@@ -566,6 +581,25 @@ async function testJatosProgress() {
     assert.equal(await otherAdapter.loadProgress(), null, '不同被试不得读到别人的进度');
 
     assert.ok(await adapter.loadProgress() !== null, '同一被试仍能读到自己的进度');
+
+    // 6b) 关键回归：同一位被试在不同 workerId 下必须落到同一个键。
+    //     MindProbe 的 General 链接每次运行都换 workerId，早期版本因此永远读不到自己的进度。
+
+    const sameSubjectNewWorker = window.CLTStorageFactories.jatos({
+
+        experimentVersion: 'test-version', gitCommit: 'abc123'
+
+    });
+
+    window.jatos.workerId = 'w-9999';
+
+    await sameSubjectNewWorker.initialize({ participant: { subjectID: '00123' }, experiment: 'demo_exp' });
+
+    assert.ok(await sameSubjectNewWorker.loadProgress() !== null,
+
+        '换 workerId 后同一位被试仍必须读到自己的进度');
+
+    window.jatos.workerId = 'w-77';
 
     // 7) 写入失败自动重试（JATOS 作者建议：失败要重试，且重试前重新取最新数据）
 
@@ -646,13 +680,15 @@ async function testProgressFailsClosedWithoutCrypto() {
 
     await adapter.initialize({ participant: { subjectID: '00123' }, experiment: 'demo_exp' });
 
-    // 写入仍然成功（进度是保险机制，存不进去/存进去都不该打断实验）
-    assert.equal(await adapter.saveProgress({ completedBlocks: 2 }), true);
+    // 无法计算被试哈希 → 无法得到进度键名 → 直接关闭续做能力：
+    // 不写、不读、不落任何键（宁可不续做，也不能退回用 workerId 之类的弱标识）
+    assert.equal(await adapter.saveProgress({ completedBlocks: 2 }), false, '无 crypto 时不得写入');
 
-    assert.equal(batchStore['demo_exp:w-31'].subjectHash, null, '无 crypto 时应写入 null 而不是原始编号');
+    assert.deepEqual(Object.keys(batchStore), [], '无 crypto 时不得写出任何键');
 
-    // 但读回时必须拒绝：无法确认归属
-    assert.equal(await adapter.loadProgress(), null, '无法计算哈希时不得返回进度');
+    assert.equal(await adapter.loadProgress(), null, '无 crypto 时不得返回进度');
+
+    assert.equal(await adapter.clearProgress(), false, '无 crypto 时不得清除（没有键可清）');
 
 }
 
@@ -691,6 +727,12 @@ async function testProgressGracefulDegradation() {
         setTimeout, Object
 
     });
+
+    // 给出 crypto，使进度键名可计算——这样测的是"缺 Batch Session"的降级，
+    // 而不是"缺 crypto"的降级（后者由 testProgressFailsClosedWithoutCrypto 覆盖）
+    window.crypto = require('node:crypto').webcrypto;
+
+    window.TextEncoder = TextEncoder;
 
     load('jatos-storage.js', context);
 
