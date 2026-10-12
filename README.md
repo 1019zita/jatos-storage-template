@@ -53,6 +53,21 @@ JATOS / Supabase 存储层的**唯一权威实现**。所有网页实验（CLT�
 `<experiment>:<workerId>`，例如 `exp1_clt:w-77`。两者缺任意一个即关闭续做能力并 `console.warn`，
 不会退回某个共用键——否则同一 Study 下两个实验会互相覆盖进度。
 
+## Batch Session 实测契约（JATOS 3.11.1，2026-10-12 在真实实例上量得）
+
+这几点用桩测不出来，必须照抄，否则续做会**静默**失效：
+
+| 行为 | 实测结果 | 本层的处理 |
+|---|---|---|
+| `batchSession.remove(path)` | 路径不带前导 `/` 时服务端回 `Failed to apply patch: Missing leading slash`，删除**不生效**（进度会永久留在服务端，同一位被试下次进来被误判为"上次没做完"） | 统一用 `remove('/' + key)`；失败重试一次；真失败时 `console.warn` 并返回 `false`（不再静默吞掉） |
+| 并发 patch | 同一时刻只接受一个，第二个回 `Can send only one batch session patch at a time` | 所有写/删经 `enqueueBatchPatch` 串行化 |
+| `batchSession.get(key)` | 批次为空时**抛异常**（不是返回 `undefined`） | 包在 `try/catch` 里，失败一律当"没有进度" |
+| `add` / `set(key, null)` 作为删除兜底 | 不可用：`add` 要求 key 不存在；`set(key, null)` 只是把值写成 `null`，并没有删除 | 已删除这两个兜底分支 |
+| `defined()` / `test()` | 与 `get()` 的本地缓存不同步（删掉之后 `defined` 可能仍为 `false`、`test` 仍为 `true`） | 一律以 `get()` 为准 |
+
+回归测试 `testBatchSessionRealApiContract` 用照抄上述契约的桩覆盖这五点，
+并对并发 patch 加了超时兜底、对"Promise 队列自等导致的静默退出"加了 `process.on('exit')` 兜底。
+
 ## 如何被实验仓库引用
 
 作为 **git submodule** 挂在实验仓库的 `src/storage`，这样入口 HTML 里的

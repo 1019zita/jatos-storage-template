@@ -82,56 +82,80 @@
             return Boolean(global.jatos && global.jatos.batchSession);
         }
 
-        // 读：jatos.batchSession.get / find 是同步的（读的是本地副本，不发请求）。
-        // key 不存在时返回 undefined。
+        // 读：jatos.batchSession.get 是同步的（读的是本地副本，不发请求）。
+        // 实测（JATOS 3.11.1）：批次为空时 get 会抛异常，key 不存在时返回 undefined，
+        // 因此整体包在 try/catch 里，失败一律当"没有进度"。
         function batchGet(key) {
             if (!batchSessionAvailable()) return undefined;
             const bs = global.jatos.batchSession;
             try {
                 if (typeof bs.get === 'function') return bs.get(key);
+            } catch (error) {
+                console.warn('[CLT storage] Batch Session 读取失败：', error);
+            }
+            try {
                 if (typeof bs.find === 'function') return bs.find('/' + key);
             } catch (error) {
-                console.warn('[CLT storage] 读取 Batch Session 失败：', error);
+                console.warn('[CLT storage] Batch Session 读取失败：', error);
             }
             return undefined;
         }
 
-        // 写：jatos.batchSession.set 返回 Promise，可能因网络/服务端或数据冲突失败。
-        // 按 JATOS 作者建议：失败要重试，且重试前重新取最新数据。
-        // 由于每个被试只写自己的 key（workerId 隔离），冲突概率极低。
+        // 实测（JATOS 3.11.1）：服务端同一时刻只接受一个 batch session patch，
+        // 并发提交会得到 "Can send only one batch session patch at a time"。
+        // 因此所有写/删都串行化——实验里 endBlock 的写与 finishExperiment 的删
+        // 本来就可能前后脚发生。
+        let batchPatchQueue = Promise.resolve();
+        function enqueueBatchPatch(patch) {
+            const result = batchPatchQueue.then(patch, patch);
+            batchPatchQueue = result.then(() => undefined, () => undefined);
+            return result;
+        }
+
+        // 写：jatos.batchSession.set 返回 Promise，可能因网络/服务端失败。
+        // 按 JATOS 作者建议：失败要重试。key 已按 workerId 隔离，冲突概率极低。
+        // 注意：重试必须留在同一个已入队的 patch 内（attemptSet 内部循环），
+        // 不能再调 batchSet —— 那会再次入队并等自己，直接死锁。
         function batchSet(key, value, attempt) {
             const tries = attempt || 0;
             if (!batchSessionAvailable() || typeof global.jatos.batchSession.set !== 'function') {
                 return Promise.reject(new Error('jatos.batchSession.set is unavailable'));
             }
-            return global.jatos.batchSession.set(key, value).catch(error => {
-                if (tries >= 2) throw error;
-                const delay = 500 * (tries + 1);
-                console.warn(`[CLT storage] Batch Session 写入失败，${delay}ms 后重试（第 ${tries + 1} 次）：`, error);
-                return new Promise(resolve => setTimeout(resolve, delay))
-                    .then(() => batchSet(key, value, tries + 1));
-            });
+            function attemptSet(n) {
+                return global.jatos.batchSession.set(key, value).catch(error => {
+                    if (n >= 2) throw error;
+                    const delay = 500 * (n + 1);
+                    console.warn(`[CLT storage] Batch Session 写入失败，${delay}ms 后重试（第 ${n + 1} 次）：`, error);
+                    return new Promise(resolve => setTimeout(resolve, delay)).then(() => attemptSet(n + 1));
+                });
+            }
+            return enqueueBatchPatch(() => attemptSet(tries));
         }
 
         // 删：实验正常结束后清掉进度，避免下次误续。
-        // remove 不可用时退化为写入 null（再读回来是 null，等价于"没有进度"）。
-        function batchRemove(key) {
-            if (!batchSessionAvailable()) return Promise.resolve(false);
-            const bs = global.jatos.batchSession;
-            try {
-                if (typeof bs.remove === 'function') {
-                    return bs.remove(key).then(() => true).catch(() => false);
-                }
-                if (typeof bs.add === 'function') {
-                    return bs.add('/' + key, null).then(() => true).catch(() => false);
-                }
-                if (typeof bs.set === 'function') {
-                    return bs.set(key, null).then(() => true).catch(() => false);
-                }
-            } catch (error) {
-                console.warn('[CLT storage] 清除 Batch Session 进度失败：', error);
+        //
+        // 实测（JATOS 3.11.1）两个必须遵守的点，否则删除会静默失败：
+        //   1) remove 的路径必须以 '/' 开头，否则服务端回
+        //      "Failed to apply patch: Missing leading slash"，进度会一直留在服务端，
+        //      同一位被试下次进来就会被误判为"上次没做完"；
+        //   2) 一次只能提交一个 patch（由 enqueueBatchPatch 串行化）。
+        // 早期版本还写了 add/set 兜底，实测都不可用（add 要求 key 不存在；
+        // set(key, null) 只是把值写成 null，并没有删除），已删除。
+        function batchRemove(key, attempt) {
+            const tries = attempt || 0;
+            if (!batchSessionAvailable() || typeof global.jatos.batchSession.remove !== 'function') {
+                return Promise.resolve(false);
             }
-            return Promise.resolve(false);
+            function attemptRemove(n) {
+                return global.jatos.batchSession.remove('/' + key).then(() => true).catch(error => {
+                    if (n >= 1) {
+                        console.warn('[CLT storage] 清除 Batch Session 进度失败：', error);
+                        return false;
+                    }
+                    return new Promise(resolve => setTimeout(resolve, 500)).then(() => attemptRemove(n + 1));
+                });
+            }
+            return enqueueBatchPatch(() => attemptRemove(tries));
         }
 
         function envelope(recordType, data) {

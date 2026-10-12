@@ -443,7 +443,14 @@ async function testJatosProgress() {
 
                 },
 
-                remove(key) { delete batchStore[key]; return Promise.resolve(); }
+                // 实测契约：remove 的路径必须带前导斜杠，否则服务端拒绝
+                remove(path) {
+                    if (typeof path !== 'string' || path[0] !== '/') {
+                        return Promise.reject(new Error('Failed to apply patch: Missing leading slash'));
+                    }
+                    delete batchStore[path.slice(1)];
+                    return Promise.resolve('Batch session update successful');
+                }
 
             }
 
@@ -608,7 +615,14 @@ async function testProgressFailsClosedWithoutCrypto() {
 
                 set(key, value) { batchStore[key] = value; return Promise.resolve(); },
 
-                remove(key) { delete batchStore[key]; return Promise.resolve(); }
+                // 实测契约：remove 的路径必须带前导斜杠，否则服务端拒绝
+                remove(path) {
+                    if (typeof path !== 'string' || path[0] !== '/') {
+                        return Promise.reject(new Error('Failed to apply patch: Missing leading slash'));
+                    }
+                    delete batchStore[path.slice(1)];
+                    return Promise.resolve('Batch session update successful');
+                }
 
             }
 
@@ -694,6 +708,153 @@ async function testProgressGracefulDegradation() {
 
 }
 
+// --- 真实 JATOS 3.11.1 的 Batch Session 契约（实测得到，桩必须照抄，
+//     否则这类缺陷在本地测试里永远看不见）：
+//       1) remove 的路径必须以 '/' 开头，否则服务端回
+//          "Failed to apply patch: Missing leading slash" —— 删除静默失败；
+//       2) 同一时刻只接受一个 patch，并发提交会报
+//          "Can send only one batch session patch at a time"；
+//       3) 批次为空时 get() 会抛异常，而不是返回 undefined。
+async function testBatchSessionRealApiContract() {
+
+    const store = {};
+
+    let patchInFlight = 0;
+
+    let concurrencyViolations = 0;
+
+    let removeWithoutSlashRejections = 0;
+
+    const window = {
+
+        CLTStorageFactories: {},
+
+        jatos: {
+
+            workerId: 'w-real',
+
+            onLoad(callback) { callback(); },
+
+            addJatosIds(t) { return Object.assign(t, { workerId: 'w-real', studyResultId: 7 }); },
+
+            appendResultData() { return Promise.resolve(); },
+
+            showBeforeUnloadWarning() {},
+
+            endStudyWithoutRedirect() { return Promise.resolve(); },
+
+            batchSession: {
+
+                get(key) {
+
+                    // 实测：批次为空时 get 抛异常
+
+                    if (Object.keys(store).length === 0) throw new Error('Batch session is empty');
+
+                    return store[key];
+
+                },
+
+                set(key, value) {
+
+                    if (patchInFlight > 0) { concurrencyViolations++; return Promise.reject(new Error('Can send only one batch session patch at a time.')); }
+
+                    patchInFlight++;
+
+                    return new Promise(resolve => setTimeout(() => {
+
+                        store[key] = value;
+
+                        patchInFlight--;
+
+                        resolve('Batch session update successful');
+
+                    }, 5));
+
+                },
+
+                remove(path) {
+
+                    if (typeof path !== 'string' || path[0] !== '/') {
+
+                        removeWithoutSlashRejections++;
+
+                        return Promise.reject(new Error('Failed to apply patch: Missing leading slash'));
+
+                    }
+
+                    if (patchInFlight > 0) { concurrencyViolations++; return Promise.reject(new Error('Can send only one batch session patch at a time.')); }
+
+                    patchInFlight++;
+
+                    return new Promise(resolve => setTimeout(() => {
+
+                        delete store[path.slice(1)];
+
+                        patchInFlight--;
+
+                        resolve('Batch session update successful');
+
+                    }, 5));
+
+                }
+
+            }
+
+        }
+
+    };
+
+    const context = vm.createContext({
+
+        window, console, Promise, Date, JSON, String, Boolean, Error,
+
+        setTimeout, Object
+
+    });
+
+    window.crypto = require('node:crypto').webcrypto;
+
+    window.TextEncoder = TextEncoder;
+
+    load('jatos-storage.js', context);
+
+    const adapter = window.CLTStorageFactories.jatos({ experimentVersion: 'x', gitCommit: 'y' });
+
+    await adapter.initialize({ participant: { subjectID: '00123' }, experiment: 'demo_exp' });
+
+    // 3) 空批次：get 抛异常也不能泄漏出来，必须当作"没有进度"
+
+    assert.equal(await adapter.loadProgress(), null, '批次为空（get 抛异常）时必须返回 null');
+
+    // 1) 写入后能读回
+
+    assert.equal(await adapter.saveProgress({ completedBlocks: 5 }), true);
+
+    assert.equal((await adapter.loadProgress()).completedBlocks, 5);
+
+    // 并发写入必须被串行化（否则真实服务端会拒绝其中一个 patch）。
+    // 超时兜底：适配器一旦死锁（例如重试逻辑再次入队、等自己），
+    // 必须让测试失败，而不是让整个测试挂住。
+    await Promise.race([
+        Promise.all([adapter.saveProgress({ completedBlocks: 6 }), adapter.saveProgress({ completedBlocks: 7 })]),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('并发 patch 超时：适配器可能死锁')), 5000))
+    ]);
+
+    assert.equal(concurrencyViolations, 0, '并发 patch 必须由适配器串行化');
+
+    assert.equal(removeWithoutSlashRejections, 0, 'remove 必须带前导斜杠');
+
+    // 2) 清除必须真的从服务端删掉（这是本测试的核心回归点）
+
+    assert.equal(await adapter.clearProgress(), true, 'clearProgress 必须返回 true');
+
+    assert.deepEqual(Object.keys(store), [], 'clearProgress 之后服务端不得再留有进度键');
+
+    assert.equal(await adapter.loadProgress(), null, '清除后不得再读到进度');
+
+}
+
 // --- 进度键名必须带实验名：调用方漏传 experiment 时宁可关闭续做，
 //     也不能让不同实验共用同一个 Batch Session 键（否则进度互相覆盖） ---
 async function testProgressRequiresExperimentName() {
@@ -724,7 +885,14 @@ async function testProgressRequiresExperimentName() {
 
                 set(key, value) { batchStore[key] = value; return Promise.resolve(); },
 
-                remove(key) { delete batchStore[key]; return Promise.resolve(); }
+                // 实测契约：remove 的路径必须带前导斜杠，否则服务端拒绝
+                remove(path) {
+                    if (typeof path !== 'string' || path[0] !== '/') {
+                        return Promise.reject(new Error('Failed to apply patch: Missing leading slash'));
+                    }
+                    delete batchStore[path.slice(1)];
+                    return Promise.resolve('Batch session update successful');
+                }
 
             }
 
@@ -777,11 +945,24 @@ async function main() {
 
     await testProgressFailsClosedWithoutCrypto();
 
+    await testBatchSessionRealApiContract();
+
     console.log('storage-adapters.test.js: PASS');
 
 }
 
 
 
-main().catch(error => { console.error(error); process.exitCode = 1; });
+// 死锁兜底：Promise 队列一旦自等（例如重试逻辑再次入队），node 会因为事件循环
+// 变空而"安静地"以 0 退出、既不报错也不打印 PASS。这里把"没跑完就退出"变成失败。
+let completed = false;
+
+process.on('exit', code => {
+    if (!completed && code === 0) {
+        console.error('storage-adapters.test.js: main() did not complete (deadlock?)');
+        process.exitCode = 1;
+    }
+});
+
+main().then(() => { completed = true; }, error => { console.error(error); process.exitCode = 1; });
 
